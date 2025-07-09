@@ -45,9 +45,8 @@ logger.addHandler(console_handler)
 BLOCKING_ACTIVE = False
 SITES_TO_BLOCK: Set[bytes] = set()
 BUFFER_SIZE = 65536
-WORKER_PIDS: List[int] = [] # This will be populated in the main scope
 
-async def update_block_status_and_list():
+async def update_block_status_and_list(worker_index: int):
     """
     Periodically checks control files to update the blocking status and site list for this worker.
     """
@@ -59,7 +58,6 @@ async def update_block_status_and_list():
             try:
                 with open(config.CONTROL_FILE_PATH, 'r') as f:
                     end_time_str = f.read().strip()
-                    # A value of -1 means the lock is indefinite.
                     if end_time_str == '-1':
                         is_currently_active = True
                     else:
@@ -67,16 +65,14 @@ async def update_block_status_and_list():
                         if time.time() < end_time:
                             is_currently_active = True
                         else:
-                            # Clean up expired lock file
                             os.remove(config.CONTROL_FILE_PATH)
             except (FileNotFoundError, ValueError):
-                pass # Lock file does not exist or is invalid, so blocking is not active.
+                pass
 
             if is_currently_active != BLOCKING_ACTIVE:
                 BLOCKING_ACTIVE = is_currently_active
                 status_str = "ENABLED" if BLOCKING_ACTIVE else "DISABLED"
-                # Log status change only from the first worker to avoid log spam
-                if os.getpid() == WORKER_PIDS[0]:
+                if worker_index == 0:
                     logger.info(f"Blocking status changed to: {status_str}")
 
             if BLOCKING_ACTIVE:
@@ -85,13 +81,13 @@ async def update_block_status_and_list():
                     sites_bytes = {s.encode('utf-8') for s in sites_list}
                     if sites_bytes != SITES_TO_BLOCK:
                         SITES_TO_BLOCK = sites_bytes
-                        if os.getpid() == WORKER_PIDS[0]:
+                        if worker_index == 0:
                             logger.info(f"Blocklist reloaded. Total sites: {len(SITES_TO_BLOCK)}")
         except FileNotFoundError:
              if BLOCKING_ACTIVE:
                  BLOCKING_ACTIVE = False
                  SITES_TO_BLOCK.clear()
-                 if os.getpid() == WORKER_PIDS[0]:
+                 if worker_index == 0:
                     logger.warning("Sites file not found, disabling block.")
         except Exception as e:
             logger.error(f"Worker (pid: {os.getpid()}) error in update loop: {e}")
@@ -109,7 +105,7 @@ async def pipe_data(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             writer.write(data)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
-        pass # Common network errors, ignore quietly
+        pass
     finally:
         writer.close()
 
@@ -118,36 +114,30 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
     """Handles an incoming client connection to the proxy."""
     server_writer = None
     try:
-        # Read the initial request headers
         headers = await asyncio.wait_for(client_reader.readuntil(b'\r\n\r\n'), timeout=5.0)
         first_line = headers.split(b'\n', 1)[0]
         parts = first_line.split(b' ')
         if len(parts) < 3:
-            return # Malformed request
+            return
         
         method, target, _ = parts
         
-        # Core blocking logic
         if BLOCKING_ACTIVE and any(site in target for site in SITES_TO_BLOCK):
-            #logger.debug(f"Blocking request for target: {target.decode(errors='ignore')}")
             client_writer.close()
             return
 
-        # Determine destination host and port
-        if method == b'CONNECT': # HTTPS traffic
+        if method == b'CONNECT':
             host, port_str = target.split(b':')
             port = int(port_str)
-        else: # HTTP traffic
+        else:
             host_header = next((line for line in headers.split(b'\r\n') if line.lower().startswith(b'host:')), None)
             if not host_header:
                 return
             host = host_header.split(b' ', 1)[1]
             port = 80
         
-        # Establish connection to the target server
         server_reader, server_writer = await asyncio.open_connection(host, port)
         
-        # Finalize connection setup with client
         if method == b'CONNECT':
             client_writer.write(b'HTTP/1.1 200 Connection Established\r\n\r\n')
             await client_writer.drain()
@@ -155,16 +145,13 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
             server_writer.write(headers)
             await server_writer.drain()
 
-        # Create two-way pipes for data transfer
         pipe1 = asyncio.create_task(pipe_data(client_reader, server_writer))
         pipe2 = asyncio.create_task(pipe_data(server_reader, client_writer))
         await asyncio.gather(pipe1, pipe2)
 
     except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
-        pass # Common network errors
+        pass
     except Exception:
-        # For unexpected errors, you might want to log them, but be careful as it can be noisy.
-        # logger.exception(f"Unexpected error in handle_client")
         pass
     finally:
         client_writer.close()
@@ -172,23 +159,25 @@ async def handle_client(client_reader: asyncio.StreamReader, client_writer: asyn
             server_writer.close()
 
 
-async def main_async_worker():
+
+async def main_async_worker(worker_index: int):
     """Main async function for a single proxy worker process."""
-    asyncio.create_task(update_block_status_and_list())
+    asyncio.create_task(update_block_status_and_list(worker_index))
     server = await asyncio.start_server(
         handle_client, config.PROXY_HOST, config.PROXY_PORT, reuse_port=True
     )
-    if os.getpid() == WORKER_PIDS[0]:
-        logger.info(f"Proxy server started on {config.PROXY_HOST}:{config.PROXY_PORT} in {len(WORKER_PIDS)} processes.")
+    
+    if worker_index == 0:
+        logger.info(f"Proxy server started on {config.PROXY_HOST}:{config.PROXY_PORT} in {config.NUM_WORKERS} processes.")
     
     async with server:
         await server.serve_forever()
 
 
-def run_proxy_worker():
+def run_proxy_worker(worker_index: int):
     """Entry point for each proxy worker process."""
     uvloop.install()
-    asyncio.run(main_async_worker())
+    asyncio.run(main_async_worker(worker_index))
 
 
 # --- 3. MCP Control Server Logic ---
@@ -199,9 +188,7 @@ mcp = FastMCP(
     instructions="This server helps the user focus by blocking distracting websites for a set duration."
 )
 
-
 def _get_persistent_sites() -> Set[str]:
-    """Reads and returns the saved list of sites from the JSON file."""
     if not os.path.exists(config.SITES_STORAGE_FILE):
         return set()
     try:
@@ -210,18 +197,14 @@ def _get_persistent_sites() -> Set[str]:
     except (json.JSONDecodeError, IOError):
         return set()
 
-
 def _save_persistent_sites(sites: Set[str]):
-    """Saves the list of sites to the JSON file."""
     try:
         with open(config.SITES_STORAGE_FILE, 'w', encoding='utf-8') as f:
             json.dump(sorted(list(sites)), f, indent=2)
     except IOError as e:
         logger.error(f"Failed to save sites file: {e}")
 
-
 def _parse_sites_from_string(sites_str: str) -> Set[str]:
-    """Reliably parses a string of sites (space or comma-separated) into a set."""
     if not sites_str:
         return set()
     return {
@@ -230,23 +213,20 @@ def _parse_sites_from_string(sites_str: str) -> Set[str]:
         if site.strip()
     }
 
-
 def _start_workers():
     """Starts the proxy worker processes if they are not already running."""
     if WORKER_PROCESSES:
         return
     logger.info(f"Starting {config.NUM_WORKERS} proxy workers...")
     
-    # Clear old PIDs and start fresh
-    WORKER_PIDS.clear() 
-    
-    for _ in range(config.NUM_WORKERS):
-        process = multiprocessing.Process(target=run_proxy_worker, daemon=True)
+    pids = []
+
+    for i in range(config.NUM_WORKERS):
+        process = multiprocessing.Process(target=run_proxy_worker, args=(i,), daemon=True)
         WORKER_PROCESSES.append(process)
         process.start()
-        WORKER_PIDS.append(process.pid)
-    logger.info(f"Workers started with PIDs: {WORKER_PIDS}")
-
+        pids.append(process.pid)
+    logger.info(f"Workers started with PIDs: {pids}")
 
 def _stop_workers():
     """Stops all running proxy worker processes."""
@@ -256,11 +236,9 @@ def _stop_workers():
     for process in WORKER_PROCESSES:
         if process.is_alive():
             process.terminate()
-            process.join(timeout=2) # Wait for graceful termination
+            process.join(timeout=2)
     WORKER_PROCESSES.clear()
-    WORKER_PIDS.clear()
     logger.info("All workers stopped.")
-
 
 def _get_status_message() -> str:
     """Generates a comprehensive status message."""
@@ -294,27 +272,24 @@ def block_sites(sites_str: str, duration_minutes: int = -1):
     """
     Adds new sites to the blocklist AND enables focus mode. This is the primary tool for starting a session.
     Example: block_sites(sites_str="youtube.com, reddit.com", duration_minutes=60)
-
     Args:
         sites_str: A comma or space-separated string of sites to add and block.
         duration_minutes: The duration in minutes for the block. Use -1 for an indefinite block.
     """
     logger.info(f"Tool 'block_sites' called with sites: '{sites_str}', duration: {duration_minutes} min.")
     
-    # 1. Add sites to the persistent list
     current_sites = _get_persistent_sites()
     new_sites_to_add = _parse_sites_from_string(sites_str)
     current_sites.update(new_sites_to_add)
     _save_persistent_sites(current_sites)
     logger.info(f"Sites added to persistent list via block_sites: {new_sites_to_add}")
 
-    # 2. Enable focus mode by creating the control file
     end_time = -1 if duration_minutes == -1 else time.time() + duration_minutes * 60
     time_str = "indefinitely" if duration_minutes == -1 else f"for {duration_minutes} minutes"
     with open(config.CONTROL_FILE_PATH, 'w') as f:
         f.write(str(end_time))
     
-    _start_workers() # Ensure workers are running
+
     logger.info(f"Focus mode enabled {time_str}.")
     return f"OK. Sites added and focus mode is now enabled {time_str}. " + _get_status_message()
 
@@ -324,7 +299,6 @@ def enable_focus_mode(duration_minutes: int = -1):
     """
     Enables focus mode for the SITES ALREADY IN THE LIST. Does not add new sites.
     Use this to start a session with your pre-configured list.
-    
     Args:
         duration_minutes: The duration in minutes for the block. Use -1 for an indefinite block.
     """
@@ -336,10 +310,11 @@ def enable_focus_mode(duration_minutes: int = -1):
     time_str = "indefinitely" if duration_minutes == -1 else f"for {duration_minutes} minutes"
     with open(config.CONTROL_FILE_PATH, 'w') as f:
         f.write(str(end_time))
-    _start_workers()
+    
+
     logger.info(f"Focus mode enabled {time_str}.")
     return f"Focus mode is now enabled {time_str}. " + _get_status_message()
-    
+
 @mcp.tool
 def disable_focus_mode() -> str:
     """
@@ -350,8 +325,6 @@ def disable_focus_mode() -> str:
         if os.path.exists(config.CONTROL_FILE_PATH):
             os.remove(config.CONTROL_FILE_PATH)
             logger.info("Focus mode disabled by user command.")
-            # Note: workers will stop by themselves after the update loop sees the file is gone.
-            # We can also explicitly stop them if desired, but letting them self-disable is fine.
             return "Focus mode has been disabled. " + _get_status_message()
         else:
             return "Focus mode was not active. " + _get_status_message()
@@ -407,7 +380,6 @@ def get_current_status() -> str:
 def _cleanup_on_shutdown(signum=None, frame=None):
     logger.info("Shutdown signal received. Cleaning up.")
     _stop_workers()
-    # Also remove the lock file on a clean shutdown if it exists
     if os.path.exists(config.CONTROL_FILE_PATH):
         try:
             os.remove(config.CONTROL_FILE_PATH)
@@ -421,22 +393,18 @@ def _cleanup_on_shutdown(signum=None, frame=None):
 if __name__ == "__main__":
     logger.info(f"Starting Focus Mode Control Server on http://{config.MCP_HOST}:{config.MCP_PORT}/mcp/")
     
-    # Ensure a sites file exists on first run
     if not os.path.exists(config.SITES_STORAGE_FILE):
         _save_persistent_sites(set())
         logger.info(f"Created empty sites storage file at: {config.SITES_STORAGE_FILE}")
 
-    # On startup, if a lock file exists, it means we're resuming a session (e.g., after a crash/reboot).
-    # So, we should start the workers immediately.
-    if os.path.exists(config.CONTROL_FILE_PATH):
-        logger.warning("Active session file found on startup. Starting proxy workers immediately.")
-        _start_workers()
 
-    # The MCP server runs in the main process.
-    # It will block here until it's stopped.
+    _start_workers()
+    if os.path.exists(config.CONTROL_FILE_PATH):
+        logger.warning("Active session file found on startup. Resuming session.")
+    
     try:
         mcp.run(transport="http", host=config.MCP_HOST, port=config.MCP_PORT)
     except (KeyboardInterrupt, SystemExit):
-        pass # The finally block will handle cleanup
+        pass
     finally:
         _cleanup_on_shutdown()
