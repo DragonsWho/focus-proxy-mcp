@@ -22,3 +22,4 @@ focusproxy.service
 .DS_Store
 
 venv/
+focusproxy_sites.json
