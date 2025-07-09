@@ -1,0 +1,24 @@
+[Unit]
+Description=FocusProxy - Local Site Blocking Proxy
+After=network.target
+
+[Service]
+# User and group that will run the service.
+# Replace 'USER' with your actual username if it's different.
+User=USER
+Group=USER
+
+# The working directory for the script.
+# All relative paths in the script (log file, sites json) will be relative to this.
+WorkingDirectory=/home/USER/Documents/Coding/focus-proxy-mcp/
+
+# The command to start the service.
+# It uses the python executable from your virtual environment.
+ExecStart=/home/USER/Documents/Coding/focus-proxy-mcp/venv/bin/python /home/USER/Documents/Coding/focus-proxy-mcp/focusproxy_server.py
+
+# Restart the service if it fails.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,24 @@
+# config.py
+
+# --- MCP Server Settings ---
+# This is the control server that listens for commands (e.g., block, unblock).
+MCP_PORT = 8003
+MCP_HOST = "127.0.0.1"
+
+# --- Proxy Server Settings ---
+# This is the actual proxy that clients connect to.
+PROXY_PORT = 8080
+PROXY_HOST = "127.0.0.1"
+
+# --- Control and Logging ---
+# Control file. Its existence and content (a Unix timestamp) determine if blocking is active.
+CONTROL_FILE_PATH = "/tmp/site_blocker.lock"
+# Persistent storage for the user's list of blocked sites.
+SITES_STORAGE_FILE = "focusproxy_sites.json"
+
+# Number of worker processes for the proxy.
+# Adjust based on your CPU cores, e.g., multiprocessing.cpu_count().
+NUM_WORKERS = 4
+
+# Path to the log file.
+LOG_FILE = "focusproxy.log"
